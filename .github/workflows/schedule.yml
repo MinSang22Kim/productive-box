@@ -4,14 +4,141 @@ on:
     types: [build-event]
   schedule:
     - cron: "0 0 * * *"
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: daily-commit-gist
 jobs:
   update-gist:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - name: Update gist
-        uses: maxam2017/productive-box@master
+        run: |
+          node --input-type=module <<'DAILY_COMMIT_JS'
+          const { GH_TOKEN, GIST_ID, TIMEZONE = 'Asia/Seoul' } = process.env;
+          if (!GH_TOKEN || !GIST_ID) throw new Error('GH_TOKEN and GIST_ID are required');
+          
+          async function github(path, options = {}) {
+            const response = await fetch(`https://api.github.com${path}`, {
+              ...options,
+              headers: {
+                Authorization: `Bearer ${GH_TOKEN}`,
+                Accept: 'application/vnd.github+json',
+                'Content-Type': 'application/json',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            });
+            if (!response.ok) throw new Error(`GitHub ${path} returned HTTP ${response.status}`);
+            return response.json();
+          }
+          
+          async function graphql(query, variables = {}) {
+            const result = await github('/graphql', {
+              method: 'POST',
+              body: JSON.stringify({ query, variables }),
+            });
+            if (result.errors?.length) {
+              throw new Error(result.errors.map(({ message }) => message).join('; '));
+            }
+            return result.data;
+          }
+          
+          async function* pages(readPage) {
+            let cursor = null;
+            do {
+              const { nodes, pageInfo } = await readPage(cursor);
+              yield* nodes;
+              if (!pageInfo.hasNextPage) return;
+              if (!pageInfo.endCursor || pageInfo.endCursor === cursor) {
+                throw new Error('GitHub returned an invalid pagination cursor');
+              }
+              cursor = pageInfo.endCursor;
+            } while (true);
+          }
+          
+          const repositoryQuery = `
+            query ($cursor: String) {
+              viewer {
+                repositoriesContributedTo(first: 100, after: $cursor, includeUserRepositories: true) {
+                  nodes { id isFork defaultBranchRef { target { oid } } }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+          `;
+          
+          const historyQuery = `
+            query ($repo: ID!, $head: GitObjectID!, $author: ID!, $cursor: String) {
+              node(id: $repo) {
+                ... on Repository {
+                  object(oid: $head) {
+                    ... on Commit {
+                      history(first: 100, after: $cursor, author: { id: $author }) {
+                        nodes { oid committedDate }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          `;
+          
+          const { viewer: { id: author } } = await graphql('query { viewer { id } }');
+          const commits = new Set();
+          const counts = [0, 0, 0, 0];
+          const hourFormat = new Intl.DateTimeFormat('en-GB', {
+            hour: '2-digit',
+            hourCycle: 'h23',
+            timeZone: TIMEZONE,
+          });
+          
+          for await (const repo of pages(async cursor => {
+            const { viewer } = await graphql(repositoryQuery, { cursor });
+            return viewer.repositoriesContributedTo;
+          })) {
+            if (repo.isFork || !repo.defaultBranchRef) continue;
+            const head = repo.defaultBranchRef.target.oid;
+            for await (const commit of pages(async cursor => {
+              const { node } = await graphql(historyQuery, { repo: repo.id, head, author, cursor });
+              return node.object.history;
+            })) {
+              if (commits.has(commit.oid)) continue;
+              const hour = Number(hourFormat.format(new Date(commit.committedDate)));
+              counts[Math.floor(hour / 6)]++;
+              commits.add(commit.oid);
+            }
+          }
+          if (commits.size === 0) throw new Error('No matching commits found');
+          
+          const labels = ['🌙 Night', '🌞 Morning', '🌆 Daytime', '🌃 Evening'];
+          const symbols = '░▏▎▍▌▋▊▉█';
+          const content = [1, 2, 3, 0].map(index => {
+            const count = counts[index];
+            const percent = count * 100 / commits.size;
+            const eighths = Math.floor(percent * 21 * 8 / 100);
+            const full = Math.floor(eighths / 8);
+            const bar = (symbols[8].repeat(full) + (full < 21 ? symbols[eighths % 8] : '')).padEnd(21, symbols[0]);
+            return `${labels[index].padEnd(10)} ${String(count).padStart(5)} commits  ${bar}  ${percent.toFixed(1).padStart(5)}%`;
+          }).join('\n');
+          
+          const gistPath = `/gists/${GIST_ID}`;
+          const gist = await github(gistPath);
+          const files = Object.values(gist.files);
+          if (files.length !== 1) throw new Error('Expected a single file in the Daily Commit Gist');
+          const [{ filename, content: previous }] = files;
+          if (previous !== content) {
+            await github(gistPath, {
+              method: 'PATCH',
+              body: JSON.stringify({ files: { [filename]: { content } } }),
+            });
+          }
+          console.log(`Daily Commit: ${commits.size} unique commits\n${content}`);
+          DAILY_COMMIT_JS
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
